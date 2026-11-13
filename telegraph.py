@@ -2,11 +2,10 @@
 # -*- coding: utf-8 -*-
 """
 Telegraph Clone - File unico, solo libreria standard Python.
-v4: URL = titolo (con rinomina automatica in modifica) + modifica solo autore
-    + editing avanzato + PWA mobile.
+v5: URL = titolo, modifica solo autore, editing avanzato, PWA mobile,
+    gestione localStorage, verifica esistenza pagine, cancellazione singola.
 Avvio:  python telegraph.py
 Apri:   http://localhost:5000
-Requisiti: Python 3.8+ (nessun pip install)
 """
 
 import http.server
@@ -23,10 +22,10 @@ from urllib.parse import urlparse, parse_qs, quote
 from datetime import datetime
 
 PORT = int(os.environ.get('PORT', 5000))
-DB_FILE = 'telegraph.db'
+DB_FILE = os.environ.get('DB_PATH', 'telegraph.db')
 
 # ============================================================
-# SLUG: traslitterazione esplicita + normalizzazione
+# SLUG
 # ============================================================
 ACCENT_MAP = {
     'à':'a','á':'a','â':'a','ã':'a','ä':'a','å':'a',
@@ -45,7 +44,6 @@ ACCENT_MAP = {
 }
 
 def make_slug(title):
-    """Trasforma il titolo in uno slug leggibile e stabile."""
     s = ''.join(ACCENT_MAP.get(ch, ch) for ch in title)
     s = unicodedata.normalize('NFKD', s).encode('ascii', 'ignore').decode('ascii')
     s = re.sub(r'[^A-Za-z0-9]+', '-', s).strip('-')
@@ -54,7 +52,6 @@ def make_slug(title):
     return s or 'page'
 
 def unique_slug(db, base, exclude_slug=None):
-    """Genera slug univoco: se esiste già, aggiunge -2, -3, ..."""
     slug = base
     counter = 2
     while True:
@@ -128,7 +125,7 @@ MANIFEST_JSON = json.dumps({
 })
 
 SERVICE_WORKER_JS = """
-const CACHE = 'telegraph-v4';
+const CACHE = 'telegraph-v5';
 self.addEventListener('install', e => self.skipWaiting());
 self.addEventListener('activate', e => self.clients.claim());
 self.addEventListener('fetch', e => {
@@ -213,10 +210,13 @@ a:hover { text-decoration:underline; }
 .modal-box .close { position:absolute; top:12px; right:16px; background:none; border:none;
   font-size:24px; cursor:pointer; color:#999; line-height:1; }
 .modal-box h2 { margin-top:0; font-size:26px; }
-.draft-item { padding:14px 0; border-bottom:1px solid #eee; }
-.draft-item .d-title { font-weight:600; font-size:16px; }
-.draft-item .d-meta { font-size:13px; color:#999; margin-top:4px; display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
-.draft-item .d-meta a { cursor:pointer; }
+.page-item { padding:14px 0; border-bottom:1px solid #eee; }
+.page-item.missing { background:#fef5f5; padding:12px 14px; border-radius:4px; margin-bottom:8px; border-bottom:none; }
+.page-item .p-title { font-weight:600; font-size:16px; }
+.page-item .p-meta { font-size:13px; color:#999; margin-top:4px; display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+.page-item .p-meta a { cursor:pointer; }
+.page-item .p-meta a.danger { color:#d32f2f; }
+.page-item .p-meta a.danger:hover { background:#fee; padding:2px 4px; border-radius:3px; }
 .warning-box { background:#fff8e6; padding:16px; border-radius:6px; margin:20px 0; border-left:4px solid #f0ad4e; }
 .warning-box p { margin:0 0 8px; }
 .warning-box p:last-child { margin-bottom:0; }
@@ -227,9 +227,14 @@ a:hover { text-decoration:underline; }
 .btn-secondary { background:#eee; color:#333; border:none; border-radius:6px;
   padding:10px 18px; font-size:15px; cursor:pointer; font-family:inherit; }
 .btn-secondary:hover { background:#ddd; }
+.btn-danger { background:#fff; color:#d32f2f; border:1px solid #d32f2f; border-radius:6px;
+  padding:10px 18px; font-size:15px; cursor:pointer; font-family:inherit; }
+.btn-danger:hover { background:#fee; }
 .edit-link-input { width:100%; padding:10px; font-size:13px;
   font-family:ui-monospace,Menlo,monospace; border:1px solid #ccc; border-radius:4px;
   box-sizing:border-box; background:#fafafa; }
+.pages-toolbar { display:flex; gap:10px; margin-bottom:16px; flex-wrap:wrap; }
+.pages-empty { color:#999; text-align:center; padding:20px 0; }
 @media (max-width:600px) {
   html, body { font-size:17px; }
   .top-bar { padding:10px 12px; font-size:13px; gap:6px; }
@@ -317,6 +322,11 @@ a:hover { text-decoration:underline; }
   <div class="modal-box">
     <button class="close" data-close="pages-modal">&times;</button>
     <h2>Le mie pagine</h2>
+    <div class="pages-toolbar">
+      <button id="pages-refresh" class="btn-secondary" style="font-size:13px;padding:6px 12px;">🔄 Verifica stato</button>
+      <button id="pages-cleanup" class="btn-secondary" style="font-size:13px;padding:6px 12px;">🧹 Rimuovi pagine mancanti</button>
+      <button id="pages-clearall" class="btn-danger" style="font-size:13px;padding:6px 12px;">⚠️ Pulisci tutto</button>
+    </div>
     <div id="pages-list"></div>
   </div>
 </div>
@@ -560,6 +570,7 @@ function restoreDraft() {
 }
 [titleEl, authorEl, storyEl].forEach(el => el.addEventListener('input', scheduleSaveDraft));
 
+// ============ MY PAGES + GESTIONE localStorage ============
 function getMyPages() {
   try { return JSON.parse(localStorage.getItem(MYPAGES_KEY) || '[]'); }
   catch (e) { return []; }
@@ -575,7 +586,40 @@ function updateMyPageTitle(slug, title) {
   const p = pages.find(x => x.slug === slug);
   if (p) { p.title = title; setMyPages(pages); }
 }
+function removeFromMyPages(slug) {
+  setMyPages(getMyPages().filter(p => p.slug !== slug));
+  localStorage.removeItem('tg_token_' + slug);
+}
+function clearAllLocalData() {
+  Object.keys(localStorage).forEach(k => {
+    if (k.startsWith('tg_')) localStorage.removeItem(k);
+  });
+}
 
+// Verifica esistenza di ogni pagina sul server (aggiorna il flag `exists`)
+async function checkPagesStatus() {
+  const pages = getMyPages();
+  const updated = [];
+  for (const p of pages) {
+    try {
+      const res = await fetch('/api/check/' + encodeURIComponent(p.slug));
+      if (res.ok) {
+        const data = await res.json();
+        updated.push(Object.assign({}, p, {
+          exists: data.exists,
+          current_slug: data.current_slug || p.slug,
+        }));
+      } else {
+        updated.push(Object.assign({}, p, { exists: false }));
+      }
+    } catch (err) {
+      updated.push(Object.assign({}, p, { exists: true }));
+    }
+  }
+  setMyPages(updated);
+}
+
+// ================= NEW =================
 document.getElementById('btn-new').addEventListener('click', () => {
   const hasContent = titleEl.value.trim() || authorEl.value.trim() || storyEl.innerHTML.trim();
   if (hasContent && !confirm('Iniziare una nuova pagina? La bozza in corso verrà scartata.')) return;
@@ -593,34 +637,102 @@ document.getElementById('btn-new').addEventListener('click', () => {
   titleEl.focus();
 });
 
-document.getElementById('btn-pages').addEventListener('click', () => {
-  renderMyPages();
+// ================= PAGES =================
+document.getElementById('btn-pages').addEventListener('click', async () => {
+  const list = document.getElementById('pages-list');
+  list.innerHTML = '<p class="pages-empty">Verifica stato pagine...</p>';
   document.getElementById('pages-modal').classList.add('open');
+  await checkPagesStatus();
+  renderMyPages();
+});
+
+document.getElementById('pages-refresh').addEventListener('click', async () => {
+  const list = document.getElementById('pages-list');
+  list.innerHTML = '<p class="pages-empty">Verifica stato pagine...</p>';
+  await checkPagesStatus();
+  renderMyPages();
+});
+
+document.getElementById('pages-cleanup').addEventListener('click', () => {
+  const missing = getMyPages().filter(p => p.exists === false);
+  if (!missing.length) { alert('Nessuna pagina mancante da rimuovere.'); return; }
+  if (!confirm('Rimuovere ' + missing.length + ' pagina/e mancante/i dalla lista? Non è possibile annullare.')) return;
+  setMyPages(getMyPages().filter(p => p.exists !== false));
+  renderMyPages();
+});
+
+document.getElementById('pages-clearall').addEventListener('click', () => {
+  if (!confirm('Pulire TUTTI i dati locali?\n\nVerranno cancellati dal browser:\n• elenco delle tue pagine\n• token di modifica\n• bozza in corso\n\nGli articoli sul server NON vengono toccati, ma perderai i link di modifica salvati solo qui.')) return;
+  if (!confirm('Sei davvero sicuro? Questa operazione non è annullabile.')) return;
+  clearAllLocalData();
+  state.currentSlug = null;
+  state.editToken = null;
+  titleEl.value = '';
+  authorEl.value = '';
+  storyEl.innerHTML = '';
+  renderMyPages();
+  alert('Dati locali puliti.');
 });
 
 function renderMyPages() {
   const list = document.getElementById('pages-list');
   const pages = getMyPages();
   if (!pages.length) {
-    list.innerHTML = '<p style="color:#999;">Nessuna pagina pubblicata. Premi PUBLISH per crearne una.</p>';
+    list.innerHTML = '<p class="pages-empty">Nessuna pagina pubblicata.<br>Premi PUBLISH per crearne una.</p>';
     return;
   }
   list.innerHTML = pages.map(p => {
     const date = new Date(p.date).toLocaleDateString('it-IT');
-    const token = localStorage.getItem('tg_token_' + p.slug);
+    const realSlug = p.current_slug || p.slug;
+    const token = localStorage.getItem('tg_token_' + realSlug);
+    const missing = p.exists === false;
+
+    if (missing) {
+      return '<div class="page-item missing">' +
+        '<div class="p-title" style="color:#d32f2f;">' + escapeHtml(p.title || 'Senza titolo') + '</div>' +
+        '<div class="p-meta">' + date +
+          ' · <span style="color:#d32f2f;">⚠️ Non trovata sul server</span>' +
+          ' · <a class="danger" data-remove="'+escapeAttr(p.slug)+'">Rimuovi dalla lista</a>' +
+        '</div>' +
+      '</div>';
+    }
+
     const actions = [];
-    actions.push('<a href="/'+encodeURIComponent(p.slug)+'" target="_blank">Apri</a>');
+    actions.push('<a href="/'+encodeURIComponent(realSlug)+'" target="_blank">Apri</a>');
     if (token) {
-      actions.push('<a data-edit="'+escapeAttr(p.slug)+'">Modifica</a>');
-      actions.push('<a data-copy="'+escapeAttr(p.slug)+'">Copia link modifica</a>');
+      actions.push('<a data-edit="'+escapeAttr(realSlug)+'">Modifica</a>');
+      actions.push('<a data-copy="'+escapeAttr(realSlug)+'">Copia link modifica</a>');
+      actions.push('<a class="danger" data-delete="'+escapeAttr(realSlug)+'">Elimina</a>');
     } else {
       actions.push('<span style="color:#bbb;">(senza token di modifica)</span>');
+      actions.push('<a class="danger" data-forget="'+escapeAttr(realSlug)+'">Dimentica</a>');
     }
-    return '<div class="draft-item">' +
-      '<div class="d-title">'+escapeHtml(p.title || 'Senza titolo')+'</div>' +
-      '<div class="d-meta">'+date+' · '+actions.join(' · ')+'</div>' +
-      '</div>';
+    return '<div class="page-item">' +
+      '<div class="p-title">' + escapeHtml(p.title || 'Senza titolo') + '</div>' +
+      '<div class="p-meta">' + date + ' · ' + actions.join(' · ') + '</div>' +
+    '</div>';
   }).join('');
+
+  // Rimuovi dalla lista (solo localStorage, articolo già mancante)
+  list.querySelectorAll('[data-remove]').forEach(a => {
+    a.addEventListener('click', (e) => {
+      e.preventDefault();
+      removeFromMyPages(a.dataset.remove);
+      renderMyPages();
+    });
+  });
+
+  // Dimentica (rimuove solo dalla lista locale, articolo esiste ancora sul server)
+  list.querySelectorAll('[data-forget]').forEach(a => {
+    a.addEventListener('click', (e) => {
+      e.preventDefault();
+      if (!confirm('Rimuovere dalla lista? L\'articolo resta online ma non avrai più il token per modificarlo da qui.')) return;
+      removeFromMyPages(a.dataset.forget);
+      renderMyPages();
+    });
+  });
+
+  // Apri modifica
   list.querySelectorAll('[data-edit]').forEach(a => {
     a.addEventListener('click', (e) => {
       e.preventDefault();
@@ -629,18 +741,45 @@ function renderMyPages() {
       window.location.href = '/edit/' + encodeURIComponent(slug) + '?token=' + encodeURIComponent(token);
     });
   });
+
+  // Copia link modifica
   list.querySelectorAll('[data-copy]').forEach(a => {
     a.addEventListener('click', async (e) => {
       e.preventDefault();
       const slug = a.dataset.copy;
       const token = localStorage.getItem('tg_token_' + slug);
       const url = location.origin + '/edit/' + encodeURIComponent(slug) + '?token=' + encodeURIComponent(token);
-      try { await navigator.clipboard.writeText(url); alert('Link di modifica copiato negli appunti.'); }
+      try { await navigator.clipboard.writeText(url); alert('Link di modifica copiato.'); }
       catch (err) { prompt('Copia questo link:', url); }
+    });
+  });
+
+  // Elimina dal server (con token)
+  list.querySelectorAll('[data-delete]').forEach(a => {
+    a.addEventListener('click', async (e) => {
+      e.preventDefault();
+      const slug = a.dataset.delete;
+      const token = localStorage.getItem('tg_token_' + slug);
+      if (!confirm('Eliminare definitivamente l\'articolo "' + slug + '"?\n\nQuesta operazione:\n• Cancella la pagina dal server\n• Chi apre il link vedrà "404 Pagina non trovata"\n• Non è annullabile')) return;
+      try {
+        const res = await fetch('/api/page/' + encodeURIComponent(slug) + '?token=' + encodeURIComponent(token), {
+          method: 'DELETE',
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.error || 'Eliminazione fallita');
+        }
+        removeFromMyPages(slug);
+        renderMyPages();
+        alert('Articolo eliminato.');
+      } catch (err) {
+        alert('Errore: ' + err.message);
+      }
     });
   });
 }
 
+// ================= PUBLISH =================
 document.getElementById('btn-publish').addEventListener('click', async () => {
   const title = titleEl.value.trim();
   const author = authorEl.value.trim();
@@ -665,7 +804,7 @@ document.getElementById('btn-publish').addEventListener('click', async () => {
         localStorage.setItem('tg_token_' + newSlug, state.editToken);
         localStorage.removeItem('tg_token_' + state.currentSlug);
         const pages = getMyPages().map(p => p.slug === state.currentSlug
-          ? Object.assign({}, p, { slug: newSlug, title: title }) : p);
+          ? Object.assign({}, p, { slug: newSlug, title: title, current_slug: newSlug }) : p);
         setMyPages(pages);
         state.currentSlug = newSlug;
       } else {
@@ -681,7 +820,8 @@ document.getElementById('btn-publish').addEventListener('click', async () => {
       if (!res.ok) throw new Error('Pubblicazione fallita');
       const data = await res.json();
       localStorage.setItem('tg_token_' + data.slug, data.edit_token);
-      saveMyPage({ slug: data.slug, title: title, date: new Date().toISOString() });
+      saveMyPage({ slug: data.slug, title: title, date: new Date().toISOString(),
+                   exists: true, current_slug: data.slug });
       clearDraft();
       state.currentSlug = data.slug;
       state.editToken = data.edit_token;
@@ -710,6 +850,7 @@ document.getElementById('pub-go').addEventListener('click', () => {
   window.location.href = document.getElementById('pub-link').href;
 });
 
+// ================= PREVIEW =================
 document.getElementById('btn-preview').addEventListener('click', () => {
   document.getElementById('preview-title').textContent = titleEl.value || 'Senza titolo';
   document.getElementById('preview-author').textContent = authorEl.value || '';
@@ -717,13 +858,16 @@ document.getElementById('btn-preview').addEventListener('click', () => {
   document.getElementById('preview-modal').classList.add('open');
 });
 
+// ================= LOGOUT =================
 document.getElementById('btn-logout').addEventListener('click', () => {
-  if (!confirm('Vuoi disconnetterti da questo dispositivo? Le pagine pubblicate restano online ma, senza il link di modifica, non potrai più modificarle da qui.')) return;
-  Object.keys(localStorage).forEach(k => { if (k.startsWith('tg_token_')) localStorage.removeItem(k); });
+  if (!confirm('Vuoi disconnetterti da questo dispositivo?\n\nVerranno rimossi dal browser:\n• elenco delle pagine\n• token di modifica\n• bozza in corso\n\nGli articoli sul server restano online, ma senza i token non potrai più modificarli da qui.\n\nPer riaverli, dovrai usare i link di modifica salvati altrove.')) return;
+  clearAllLocalData();
   state.currentSlug = null; state.editToken = null;
-  alert('Disconnesso.');
+  titleEl.value = ''; authorEl.value = ''; storyEl.innerHTML = '';
+  alert('Disconnesso. Dati locali cancellati.');
 });
 
+// ================= UTILITY =================
 document.querySelectorAll('[data-close]').forEach(b => b.addEventListener('click', () => {
   document.getElementById(b.dataset.close).classList.remove('open');
 }));
@@ -740,6 +884,7 @@ function escapeAttr(s) {
   return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
 }
 
+// ================= INIT =================
 (function init() {
   const m = window.location.pathname.match(/^\/edit\/(.+)$/);
   if (m) {
@@ -751,7 +896,7 @@ function escapeAttr(s) {
         titleEl.value = data.title;
         authorEl.value = data.author;
         storyEl.innerHTML = data.content;
-        state.currentSlug = slug;
+        state.currentSlug = data.slug;
         state.editToken = token;
         document.getElementById('btn-publish').textContent = 'UPDATE';
       })
@@ -873,10 +1018,36 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == '/icon-512.png':   return self._send(200, ICON_512, 'image/png')
         if path == '/':               return self._send(200, INDEX_HTML)
 
+        # API: verifica esistenza di una pagina
+        m = re.match(r'^/api/check/([^/]+)$', path)
+        if m:
+            slug = m.group(1)
+            redirect = get_db().execute(
+                'SELECT new_slug FROM slug_redirects WHERE old_slug=?', (slug,)
+            ).fetchone()
+            if redirect:
+                return self._json(200, {'exists': True, 'current_slug': redirect['new_slug']})
+            page = get_db().execute('SELECT slug FROM pages WHERE slug=?', (slug,)).fetchone()
+            if page:
+                return self._json(200, {'exists': True, 'current_slug': page['slug']})
+            return self._json(200, {'exists': False})
+
+        # Editor: modifica
         m = re.match(r'^/edit/([^/]+)$', path)
         if m:
             slug = m.group(1)
             token = query.get('token', [''])[0]
+            redirect = get_db().execute(
+                'SELECT new_slug FROM slug_redirects WHERE old_slug=?', (slug,)
+            ).fetchone()
+            if redirect:
+                new_url = '/edit/' + quote(redirect['new_slug'])
+                if token:
+                    new_url += '?token=' + quote(token)
+                self.send_response(301)
+                self.send_header('Location', new_url)
+                self.end_headers()
+                return
             page = get_db().execute('SELECT * FROM pages WHERE slug=?', (slug,)).fetchone()
             if not page:
                 return self._error_page(404, 'Pagina non trovata',
@@ -888,6 +1059,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "mostrato alla pubblicazione.")
             return self._send(200, INDEX_HTML)
 
+        # API: dati di una pagina per la modifica
         m = re.match(r'^/api/page/([^/]+)$', path)
         if m:
             slug = m.group(1)
@@ -901,6 +1073,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 'edit_token': page['edit_token'],
             })
 
+        # Pagina pubblica (con redirect se rinominata)
         m = re.match(r'^/([^/]+)$', path)
         if m:
             slug = m.group(1)
@@ -975,13 +1148,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
             db.commit()
         return self._json(200, {'ok': True, 'slug': new_slug})
 
+    def do_DELETE(self):
+        m = re.match(r'^/api/page/([^/]+)$', self.path)
+        if not m: return self._json(404, {'error': 'not found'})
+        slug = m.group(1)
+        parsed = urlparse(self.path)
+        query = parse_qs(parsed.query)
+        token = query.get('token', [''])[0]
+        page = get_db().execute('SELECT * FROM pages WHERE slug=?', (slug,)).fetchone()
+        if not page: return self._json(404, {'error': 'not found'})
+        if token != page['edit_token']: return self._json(403, {'error': 'invalid token'})
+        with get_db() as db:
+            db.execute('DELETE FROM pages WHERE slug=?', (slug,))
+            db.execute('DELETE FROM slug_redirects WHERE old_slug=? OR new_slug=?', (slug, slug))
+            db.commit()
+        print(f'[DELETE] "{slug}"')
+        return self._json(200, {'ok': True})
+
 # ============================================================
 # AVVIO
 # ============================================================
 if __name__ == '__main__':
     init_db()
     print('=' * 60)
-    print('  Telegraph Clone v4')
+    print('  Telegraph Clone v5')
     print('=' * 60)
     print(f'  Locale:  http://localhost:{PORT}')
     try:
